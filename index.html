@@ -326,7 +326,7 @@ canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
 <!-- MENU -->
 <div id="menu" class="screen">
   <div class="logo">PONG</div>
-  <div class="tagline">Arcae · Mobile</div>
+  <div class="tagline">Arcade · Mobile</div>
   <div class="mode-cards">
     <div class="mode-card vs-bot selected" id="card-bot" onclick="selectMode('bot')">
       <div class="mode-icon">🤖</div><div class="mode-name">VS BOT</div>
@@ -578,7 +578,7 @@ function updateMySlot() {
 }
 
 function leaveLobby() {
-  peerClose();
+  wsClose();
   currentCode=null;
   const banner=document.getElementById('autojoin-banner');
   if(banner)banner.classList.remove('show');
@@ -586,19 +586,14 @@ function leaveLobby() {
   hide('lobby'); show('online-setup'); buildFlags();
 }
 
-
-
-// ─── PEERJS NETWORKING ────────────────────────────────────
-// PeerJS: kostenloser P2P Broker, zuverlässig, kein eigener Server nötig
-let peer = null;
-let conn = null;
-let _onConnData = null;
-let _onConnClose = null;
-
-const PEER_CFG = {
-  host: '0.peerjs.com', port: 443, path: '/', secure: true,
-  config: { iceServers: [{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}] }
-};
+// ─── WEBRTC ───────────────────────────────────────────────
+// ─── WEBSOCKET NETWORKING (ersetzt PeerJS) ─────────────────
+// Nutzt SocketsBay public WS relay. Beide spieler joinen denselben Kanal.
+let ws = null;
+let wsChannel = null;
+let wsPingTimer = null;
+let wsOnMsg = null;
+let wsOnClose = null;
 
 function mkCode() {
   const C='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -606,66 +601,66 @@ function mkCode() {
   return c;
 }
 
-function loadPeerJS(cb) {
-  if(window.Peer){ cb(); return; }
-  const s=document.createElement('script');
-  s.src='https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
-  s.onload=cb;
-  s.onerror=()=>lobbyErr('PeerJS konnte nicht geladen werden. Bitte Internet prüfen.');
-  document.head.appendChild(s);
+function wsConnect(code, onOpen, onMsg, onClose) {
+  wsClose();
+  wsChannel = code;
+  wsOnMsg = onMsg;
+  wsOnClose = onClose;
+  ws = new WebSocket('wss://socketsbay.com/wss/v2/1/pong'+code+'/');
+  ws.onopen = () => {
+    wsPingTimer = setInterval(()=>{ try{ws.send(JSON.stringify({t:'ping',ch:code}));}catch(e){} }, 25000);
+    onOpen && onOpen();
+  };
+  ws.onmessage = e => {
+    try {
+      const d = JSON.parse(e.data);
+      if(d && d.ch === code && d.t !== 'ping') wsOnMsg && wsOnMsg(d);
+    } catch(ex) {}
+  };
+  ws.onclose = () => { clearInterval(wsPingTimer); wsOnClose && wsOnClose(); };
+  ws.onerror = () => { lobbyErr('Verbindungsfehler – bitte nochmal versuchen.'); };
 }
 
-function peerSend(obj) {
-  if(conn && conn.open) conn.send(obj);
+function wsSend(obj) {
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify({...obj, ch: wsChannel}));
 }
 
-function peerClose() {
-  _onConnData=null; _onConnClose=null;
-  if(conn){ try{conn.close();}catch(e){} conn=null; }
-  if(peer){ try{peer.destroy();}catch(e){} peer=null; }
+function wsClose() {
+  clearInterval(wsPingTimer);
+  if(ws){ try{ws.close();}catch(e){} ws=null; }
 }
 
-function wireConn(c) {
-  conn = c;
-  c.on('data', d=>{ _onConnData && _onConnData(d); });
-  c.on('close', ()=>{ _onConnClose && _onConnClose(); });
-  c.on('error', ()=>{ _onConnClose && _onConnClose(); });
-}
-
-// ── FREUND EINLADEN (Host) ────────────────────────────────
 function startHost() {
-  loadPeerJS(()=>{
-    const code = mkCode();
-    currentCode = code;
-    isHost=true; onlineRole='p1';
-    document.getElementById('lobby-code').textContent = code;
-    document.getElementById('lobby-code').onclick = ()=>copyCodeOnly();
-    document.getElementById('lobby-sub').textContent = 'Warte auf Gegner...';
-
-    peer = new Peer('ppng-'+code, PEER_CFG);
-    peer.on('open', ()=>{});
-    peer.on('connection', c=>{
-      wireConn(c);
-      _onConnData = d=>{
-        if(d.t==='join'){
-          oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
-          peerSend({t:'hello',nick:myNick,flag:myFlag});
-          showOpponentReady();
+  const code = mkCode();
+  currentCode = code;
+  isHost = true; onlineRole = 'p1';
+  document.getElementById('lobby-code').textContent = code;
+  document.getElementById('lobby-code').onclick = ()=>copyCodeOnly();
+  document.getElementById('lobby-sub').textContent = 'Warte auf Gegner...';
+  wsConnect(code,
+    () => { /* warte auf Gegner */ },
+    (d) => {
+      if(d.t === 'join') {
+        // Gegner hat gejoint: sende hello
+        oppNick = d.nick || 'GEGNER'; oppFlag = d.flag || '🏳️';
+        wsSend({t:'hello', nick:myNick, flag:myFlag});
+        showOpponentReady();
+        if(!document.getElementById('lobby-go-btn').classList.contains('show'))
           document.getElementById('lobby-go-btn').classList.add('show');
-          document.getElementById('wait-dots').style.display='none';
-        }
-        if(d.t==='input') remoteX=d.x;
-        if(d.t==='state'){} // host ignores
-      };
-      _onConnClose = ()=>{ if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } };
-    });
-    peer.on('error', e=>lobbyErr('Fehler: '+e.type+' – bitte nochmal versuchen.'));
-  });
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') {} // host ignores state from guest
+    },
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
+  );
 }
 
 function shareLink() {
   if(!currentCode)return;
   const url=getShareUrl(currentCode);
+  const text='🏓 Spiel Pong gegen mich!\nCode: '+currentCode+'\n'+url;
   if(navigator.share){
     navigator.share({title:'PONG – Spiel gegen mich!', text:'Tritt meinem Spiel bei! Code: '+currentCode, url:url}).catch(()=>{});
   } else {
@@ -676,7 +671,8 @@ function shareLink() {
 
 function copyCodeOnly() {
   if(!currentCode)return;
-  navigator.clipboard?.writeText(currentCode).catch(()=>{});
+  const disp=currentCode;
+  navigator.clipboard?.writeText(disp).catch(()=>{});
   setShareFeedback('✓ CODE KOPIERT!');
 }
 
@@ -698,6 +694,7 @@ function checkUrlCode(){
   const params=new URLSearchParams(location.search);
   const code=params.get('code');
   if(!code||code.length!==4)return;
+  // Pre-fill and auto-join
   openOnlineSetup();
   goLobbyJoiner(code.toUpperCase());
 }
@@ -706,134 +703,87 @@ function goLobbyJoiner(code){
   readProfile(); isHost=false;
   show('lobby'); hide('online-setup'); hide('menu');
   document.getElementById('lobby-title').textContent='TRITT BEI';
-  document.getElementById('lobby-sub').textContent='Verbinde...';
+  document.getElementById('lobby-sub').textContent='Verbinde mit Spiel...';
   document.getElementById('code-box').style.display='none';
   hide('join-row');
+  // Show auto-join banner
   const banner=document.getElementById('autojoin-banner');
   banner.classList.add('show');
   document.getElementById('autojoin-code-display').textContent=code;
   updateMySlot();
-  joinByCodeDirect(code);
+  autoJoinCode(code);
 }
 
-function joinByCodeDirect(code){
+function autoJoinCode(code){
   isHost=false; onlineRole='p2';
-  loadPeerJS(()=>{
-    peer = new Peer(PEER_CFG);
-    peer.on('open', ()=>{
-      conn = peer.connect('ppng-'+code, {reliable:true});
-      wireConn(conn);
-      conn.on('open', ()=>{
-        peerSend({t:'join',nick:myNick,flag:myFlag});
+  wsConnect(code,
+    () => {
+      // Connected — announce ourselves
+      wsSend({t:'join', nick:myNick, flag:myFlag});
+    },
+    (d) => {
+      if(d.t === 'hello'){
+        oppNick = d.nick||'HOST'; oppFlag = d.flag||'🏳️';
         document.getElementById('autojoin-banner').classList.remove('show');
-        _onConnData = d=>{
-          if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('wait-dots').style.display='none'; }
-          if(d.t==='start') beginOnlineGame();
-          if(d.t==='input') remoteX=d.x;
-          if(d.t==='state') applyState(d);
-        };
-        _onConnClose = ()=>{ if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } };
-      });
-      conn.on('error', ()=>lobbyErr('Code ungültig oder Spiel nicht gefunden.'));
-    });
-    peer.on('error', ()=>lobbyErr('Verbindung fehlgeschlagen – bitte nochmal versuchen.'));
-  });
+        showOpponentReady();
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') applyState(d);
+    },
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
+  );
 }
 
-// ── ZUFÄLLIG (Matchmaking ohne Code) ─────────────────────
-// Prinzip: Es gibt ~20 feste "Warteräume" (PONG-POOL-00 bis 19).
-// Jeder Spieler wählt zufällig einen und versucht sich als Gast zu verbinden.
-// Schlägt die Verbindung nach 3s fehl → er wird Host dieses Raums.
-// Wenn ein Gast verbindet → Spiel startet automatisch.
 function startRandom() {
-  loadPeerJS(()=>{
-    const slot = String(Math.floor(Math.random()*20)).padStart(2,'0');
-    const roomId = 'ppng-pool-'+slot;
-    isHost=false; onlineRole='p2';
+  // ── Matchmaking ohne Code ──────────────────────────────
+  // Alle landen im gleichen Raum "ZUFALLQ" und senden "seek".
+  // Wer als Erster ein fremdes "seek" empfängt wird Host,
+  // antwortet mit "hello" und startet automatisch.
+  // Der andere empfängt "hello" → beide starten sofort.
+  const POOL = 'ZUFALLQ';
+  currentCode = POOL;
+  let matched = false;
 
-    peer = new Peer(PEER_CFG);
-    peer.on('open', ()=>{
-      // Versuche als Gast beizutreten
-      const c = peer.connect(roomId, {reliable:true});
-      let connected = false;
+  // Zufällige kleine Verzögerung (0–300 ms) damit nicht
+  // zwei Spieler gleichzeitig Host werden
+  const delay = Math.random() * 300;
 
-      c.on('open', ()=>{
-        connected=true;
-        conn=c; wireConn(c);
-        peerSend({t:'join',nick:myNick,flag:myFlag});
-        _onConnData = d=>{
-          if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('lobby-sub').textContent='Gegner gefunden!'; document.getElementById('wait-dots').style.display='none'; }
-          if(d.t==='start') beginOnlineGame();
-          if(d.t==='input') remoteX=d.x;
-          if(d.t==='state') applyState(d);
-        };
-        _onConnClose = ()=>{ if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } };
-      });
-
-      // Nach 3s: wenn kein Host da → selbst Host werden
-      setTimeout(()=>{
-        if(connected)return;
-        try{c.close();}catch(e){}
-        becomeRandomHost(roomId);
-      }, 3000);
-    });
-    peer.on('error', e=>{
-      // Peer-ID belegt = jemand ist schon Host → als Gast versuchen (retry)
-      if(e.type==='unavailable-id'){ retryAsGuest(peer, roomId); return; }
-      lobbyErr('Fehler: '+e.type);
-    });
-  });
-}
-
-function becomeRandomHost(roomId) {
-  peerClose();
-  isHost=true; onlineRole='p1';
-  document.getElementById('lobby-sub').textContent='Warte auf Gegner...';
-
-  peer = new Peer(roomId, PEER_CFG);
-  peer.on('open', ()=>{});
-  peer.on('connection', c=>{
-    conn=c; wireConn(c);
-    _onConnData = d=>{
-      if(d.t==='join'){
-        oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
-        peerSend({t:'hello',nick:myNick,flag:myFlag});
+  wsConnect(POOL,
+    () => {
+      setTimeout(() => {
+        if(!matched) wsSend({t:'seek', nick:myNick, flag:myFlag});
+      }, delay);
+    },
+    (d) => {
+      // Fremdes "seek" gesehen → ich werde Host
+      if(d.t === 'seek' && !matched && !isHost) {
+        matched = true;
+        isHost = true; onlineRole = 'p1';
+        oppNick = d.nick||'GEGNER'; oppFlag = d.flag||'🏳️';
+        wsSend({t:'hello', nick:myNick, flag:myFlag});
         showOpponentReady();
         document.getElementById('lobby-sub').textContent='Gegner gefunden! Starte...';
         document.getElementById('wait-dots').style.display='none';
-        setTimeout(()=>{ peerSend({t:'start'}); beginOnlineGame(); }, 800);
+        // Kurze Anzeige dann direkt starten
+        setTimeout(()=>{ wsSend({t:'start'}); beginOnlineGame(); }, 800);
       }
-      if(d.t==='input') remoteX=d.x;
-    };
-    _onConnClose = ()=>{ if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } };
-  });
-  peer.on('error', e=>{
-    // Slot belegt → anderen Slot probieren
-    if(e.type==='unavailable-id'){
-      peerClose();
-      const slot2=String(Math.floor(Math.random()*20)).padStart(2,'0');
-      becomeRandomHost('ppng-pool-'+slot2);
-    } else lobbyErr('Fehler: '+e.type);
-  });
-}
-
-function retryAsGuest(existingPeer, roomId) {
-  // Peer schon erstellt, nochmal als Gast verbinden
-  const c = existingPeer.connect(roomId, {reliable:true});
-  let connected=false;
-  c.on('open', ()=>{
-    connected=true;
-    conn=c; wireConn(c);
-    peerSend({t:'join',nick:myNick,flag:myFlag});
-    _onConnData = d=>{
-      if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('lobby-sub').textContent='Gegner gefunden!'; document.getElementById('wait-dots').style.display='none'; }
-      if(d.t==='start') beginOnlineGame();
-      if(d.t==='input') remoteX=d.x;
-      if(d.t==='state') applyState(d);
-    };
-    _onConnClose = ()=>{ if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } };
-  });
-  setTimeout(()=>{ if(!connected){ try{c.close();}catch(e){} becomeRandomHost(roomId); } }, 3000);
+      // Ich habe "seek" gesendet und bekomme "hello" → Gast
+      if(d.t === 'hello' && !matched) {
+        matched = true;
+        isHost = false; onlineRole = 'p2';
+        oppNick = d.nick||'HOST'; oppFlag = d.flag||'🏳️';
+        showOpponentReady();
+        document.getElementById('lobby-sub').textContent='Gegner gefunden! Starte...';
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') applyState(d);
+    },
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
+  );
 }
 
 function joinByCode() {
@@ -849,9 +799,9 @@ function showOpponentReady(){
   s.innerHTML=`<div class="pslot-flag">${oppFlag}</div><div class="pslot-name">${oppNick}</div><div class="pslot-status ok">BEREIT</div>`;
 }
 
-function setupConn() {}
+function setupConn() { /* legacy stub — not used with WS */ }
 
-function hostStartGame() { peerSend({t:'start'}); beginOnlineGame(); }
+function hostStartGame() { wsSend({t:'start'}); beginOnlineGame(); }
 
 function beginOnlineGame() {
   if(onlineRole==='p1'){ p1Label=myNick+' '+myFlag; p2Label=oppNick+' '+oppFlag; }
@@ -1011,11 +961,11 @@ function updateBot() {
 
 // ─── ONLINE SYNC ──────────────────────────────────────────
 function sendInput() {
-  if(!conn||!conn.open)return;
+  if(!ws||ws.readyState!==1)return;
   const myX=onlineRole==='p1'?paddles.p1.x:paddles.p2.x;
-  peerSend({t:'input',x:myX});
+  wsSend({t:'input',x:myX});
   if(isHost&&syncTick%3===0){
-    peerSend({t:'state',bx:ball.x,by:ball.y,vx:ball.vx,vy:ball.vy,sp:ball.speed,s1:scores.p1,s2:scores.p2});
+    wsSend({t:'state',bx:ball.x,by:ball.y,vx:ball.vx,vy:ball.vy,sp:ball.speed,s1:scores.p1,s2:scores.p2});
   }
   syncTick++;
 }
