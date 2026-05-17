@@ -577,42 +577,83 @@ function updateMySlot() {
 }
 
 function leaveLobby() {
-  if(peer){ try{peer.destroy();}catch(e){} peer=null; } conn=null;
+  wsClose();
   currentCode=null;
   const banner=document.getElementById('autojoin-banner');
   if(banner)banner.classList.remove('show');
-  // Clean URL if joined via link
   if(history.replaceState)history.replaceState(null,'',location.pathname);
   hide('lobby'); show('online-setup'); buildFlags();
 }
 
 // ─── WEBRTC ───────────────────────────────────────────────
-function loadPeerJS(cb) {
-  if(window.Peer){cb();return;}
-  const s=document.createElement('script');
-  s.src='https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js';
-  s.onload=cb;
-  s.onerror=()=>lobbyErr('PeerJS konnte nicht geladen werden.');
-  document.head.appendChild(s);
-}
+// ─── WEBSOCKET NETWORKING (ersetzt PeerJS) ─────────────────
+// Nutzt SocketsBay public WS relay. Beide spieler joinen denselben Kanal.
+let ws = null;
+let wsChannel = null;
+let wsPingTimer = null;
+let wsOnMsg = null;
+let wsOnClose = null;
 
 function mkCode() {
   const C='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   let c='';for(let i=0;i<4;i++)c+=C[Math.random()*C.length|0];
-  return 'pp-'+c;
+  return c;
+}
+
+function wsConnect(code, onOpen, onMsg, onClose) {
+  wsClose();
+  wsChannel = code;
+  wsOnMsg = onMsg;
+  wsOnClose = onClose;
+  ws = new WebSocket('wss://socketsbay.com/wss/v2/1/pong'+code+'/');
+  ws.onopen = () => {
+    wsPingTimer = setInterval(()=>{ try{ws.send(JSON.stringify({t:'ping',ch:code}));}catch(e){} }, 25000);
+    onOpen && onOpen();
+  };
+  ws.onmessage = e => {
+    try {
+      const d = JSON.parse(e.data);
+      if(d && d.ch === code && d.t !== 'ping') wsOnMsg && wsOnMsg(d);
+    } catch(ex) {}
+  };
+  ws.onclose = () => { clearInterval(wsPingTimer); wsOnClose && wsOnClose(); };
+  ws.onerror = () => { lobbyErr('Verbindungsfehler – bitte nochmal versuchen.'); };
+}
+
+function wsSend(obj) {
+  if(ws && ws.readyState === 1) ws.send(JSON.stringify({...obj, ch: wsChannel}));
+}
+
+function wsClose() {
+  clearInterval(wsPingTimer);
+  if(ws){ try{ws.close();}catch(e){} ws=null; }
 }
 
 function startHost() {
-  loadPeerJS(()=>{
-    const room=mkCode();
-    const disp=room.replace('pp-','');
-    currentCode=disp; // store globally
-    document.getElementById('lobby-code').textContent=disp;
-    document.getElementById('lobby-code').onclick=()=>copyCodeOnly();
-    peer=new Peer(room);
-    peer.on('connection',c=>{conn=c; onlineRole='p1'; setupConn();});
-    peer.on('error',e=>lobbyErr('Fehler: '+e.type));
-  });
+  const code = mkCode();
+  currentCode = code;
+  isHost = true; onlineRole = 'p1';
+  document.getElementById('lobby-code').textContent = code;
+  document.getElementById('lobby-code').onclick = ()=>copyCodeOnly();
+  document.getElementById('lobby-sub').textContent = 'Warte auf Gegner...';
+  wsConnect(code,
+    () => { /* warte auf Gegner */ },
+    (d) => {
+      if(d.t === 'join') {
+        // Gegner hat gejoint: sende hello
+        oppNick = d.nick || 'GEGNER'; oppFlag = d.flag || '🏳️';
+        wsSend({t:'hello', nick:myNick, flag:myFlag});
+        showOpponentReady();
+        if(!document.getElementById('lobby-go-btn').classList.contains('show'))
+          document.getElementById('lobby-go-btn').classList.add('show');
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') {} // host ignores state from guest
+    },
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
+  );
 }
 
 function shareLink() {
@@ -673,85 +714,92 @@ function goLobbyJoiner(code){
 }
 
 function autoJoinCode(code){
-  loadPeerJS(()=>{
-    peer=new Peer(mkCode());
-    peer.on('open',()=>{
-      conn=peer.connect('pp-'+code,{reliable:true});
-      isHost=false; onlineRole='p2';
-      conn.on('open',()=>{
+  isHost=false; onlineRole='p2';
+  wsConnect(code,
+    () => {
+      // Connected — announce ourselves
+      wsSend({t:'join', nick:myNick, flag:myFlag});
+    },
+    (d) => {
+      if(d.t === 'hello'){
+        oppNick = d.nick||'HOST'; oppFlag = d.flag||'🏳️';
         document.getElementById('autojoin-banner').classList.remove('show');
-        setupConn();
-      });
-      conn.on('error',()=>lobbyErr('Code ungültig oder Spiel nicht gefunden.'));
-    });
-    peer.on('error',()=>lobbyErr('Verbindung fehlgeschlagen.'));
-  });
+        showOpponentReady();
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') applyState(d);
+    },
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
+  );
 }
 
 function startRandom() {
-  // Pool of random rooms: try to join one, else host
-  loadPeerJS(()=>{
-    const pool=['pp-RAND1','pp-RAND2','pp-RAND3','pp-RAND4','pp-RAND5'];
-    const tryRoom=pool[Math.floor(Math.random()*pool.length)];
-    const myId=mkCode();
-    peer=new Peer(myId);
-    peer.on('open',()=>{
-      const c=peer.connect(tryRoom,{reliable:true});
-      let joined=false;
-      c.on('open',()=>{
-        joined=true; conn=c; isHost=false; onlineRole='p2'; setupConn();
-      });
+  // Try 5 fixed pool rooms via WS; if no host after 4s, become host
+  const pool=['RNDM1','RNDM2','RNDM3','RNDM4','RNDM5'];
+  const tryCode=pool[Math.floor(Math.random()*pool.length)];
+  isHost=false; onlineRole='p2';
+  let found=false;
+  wsConnect(tryCode,
+    () => {
+      wsSend({t:'join', nick:myNick, flag:myFlag});
       setTimeout(()=>{
-        if(!joined){
-          c.close(); peer.destroy();
-          peer=new Peer(tryRoom);
-          peer.on('open',()=>{ document.getElementById('lobby-sub').textContent='Warte auf Gegner...'; });
-          peer.on('connection',inc=>{ conn=inc; isHost=true; onlineRole='p1'; setupConn(); });
-          peer.on('error',()=>startRandom()); // room taken, retry
+        if(!found){
+          // No host responded — become host
+          wsClose();
+          currentCode=tryCode;
+          isHost=true; onlineRole='p1';
+          document.getElementById('lobby-sub').textContent='Warte auf Zufalls-Gegner...';
+          wsConnect(tryCode,
+            ()=>{},
+            (d)=>{
+              if(d.t==='join'){
+                oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
+                wsSend({t:'hello',nick:myNick,flag:myFlag});
+                showOpponentReady();
+                document.getElementById('lobby-go-btn').classList.add('show');
+                document.getElementById('wait-dots').style.display='none';
+              }
+              if(d.t==='start') beginOnlineGame();
+              if(d.t==='input') remoteX=d.x;
+            },
+            ()=>{}
+          );
         }
-      },4000);
-    });
-    peer.on('error',()=>lobbyErr('Verbindung fehlgeschlagen.'));
-  });
+      }, 4000);
+    },
+    (d)=>{
+      if(d.t==='hello' && !found){
+        found=true;
+        oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️';
+        showOpponentReady();
+        document.getElementById('wait-dots').style.display='none';
+      }
+      if(d.t==='start') beginOnlineGame();
+      if(d.t==='input') remoteX=d.x;
+      if(d.t==='state') applyState(d);
+    },
+    ()=>{}
+  );
 }
 
 function joinByCode() {
   const code=document.getElementById('join-input').value.trim().toUpperCase();
   if(code.length<4)return;
   readProfile();
-  loadPeerJS(()=>{
-    peer=new Peer(mkCode());
-    peer.on('open',()=>{
-      conn=peer.connect('pp-'+code,{reliable:true});
-      isHost=false; onlineRole='p2';
-      conn.on('open',setupConn);
-      conn.on('error',()=>lobbyErr('Code ungültig oder abgelaufen.'));
-    });
-    peer.on('error',()=>lobbyErr('Verbindung fehlgeschlagen.'));
-  });
+  goLobbyJoiner(code);
 }
 
-function setupConn() {
-  conn.send({type:'hello',nick:myNick,flag:myFlag});
-  conn.on('data',d=>{
-    if(d.type==='hello'){
-      oppNick=d.nick; oppFlag=d.flag;
-      const s=document.getElementById('pslot-opp');
-      s.classList.add('ready');
-      s.innerHTML=`<div class="pslot-flag">${d.flag}</div><div class="pslot-name">${d.nick}</div><div class="pslot-status ok">BEREIT</div>`;
-      document.getElementById('wait-dots').style.display='none';
-      if(isHost) document.getElementById('lobby-go-btn').classList.add('show');
-    }
-    if(d.type==='start') beginOnlineGame();
-    if(d.type==='input') remoteX=d.x;
-    if(d.type==='state' && !isHost) applyState(d);
-  });
-  conn.on('close',()=>{
-    if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); }
-  });
+function showOpponentReady(){
+  const s=document.getElementById('pslot-opp');
+  s.classList.add('ready');
+  s.innerHTML=`<div class="pslot-flag">${oppFlag}</div><div class="pslot-name">${oppNick}</div><div class="pslot-status ok">BEREIT</div>`;
 }
 
-function hostStartGame() { conn.send({type:'start'}); beginOnlineGame(); }
+function setupConn() { /* legacy stub — not used with WS */ }
+
+function hostStartGame() { wsSend({t:'start'}); beginOnlineGame(); }
 
 function beginOnlineGame() {
   if(onlineRole==='p1'){ p1Label=myNick+' '+myFlag; p2Label=oppNick+' '+oppFlag; }
@@ -795,6 +843,19 @@ function launchGame() {
     gState='paused';
     showOverlay(diff==='pro'?'PRO MODE':'SCHWER','💡 Paddle-Rand = Kurve\nBall an die Ecken!','LOS GEHT\'S');
   }
+
+  // PC-Steuerung Hinweis (kein Touch-Gerät)
+  if(!('ontouchstart' in window) && mode!=='online'){
+    const hint = mode==='human'
+      ? '🖱 MAUS / A–D = UNTEN\nJ–L = OBEN  |  ESC = PAUSE'
+      : '🖱 MAUS ODER A / D TASTEN  |  ESC = PAUSE';
+    if(gState!=='paused'){
+      gState='paused';
+      showOverlay('BEREIT?', hint, 'SPIELEN');
+    } else {
+      document.getElementById('overlay-sub').textContent=hint;
+    }
+  }
 }
 
 function goMenu() {
@@ -825,21 +886,56 @@ function initRound(dir) {
   trail=[]; botDelayBuf=[]; botErrorOffset=0; remoteX=null; syncTick=0;
 }
 
-// ─── TOUCH ────────────────────────────────────────────────
+// ─── TOUCH + MAUS + TASTATUR ──────────────────────────────
 let touchSetupDone=false;
+const keys={};
+let mouseX=null, mouseActive=false;
+
 function setupTouch() {
   if(touchSetupDone)return; touchSetupDone=true;
+
+  // Touch
   document.addEventListener('touchstart',onTouch,{passive:false});
   document.addEventListener('touchmove', onTouch,{passive:false});
   document.addEventListener('touchend',  onTEnd, {passive:false});
   document.addEventListener('touchcancel',onTEnd,{passive:false});
+
+  // Maus steuert das untere (eigene) Paddle direkt
+  document.addEventListener('mousemove', e=>{
+    if(e.target.closest('button,#overlay,#pause-btn,#hud'))return;
+    mouseX=e.clientX; mouseActive=true;
+  });
+  document.addEventListener('mouseleave',()=>{ mouseActive=false; });
+
+  // Tastatur
+  document.addEventListener('keydown', e=>{
+    keys[e.key]=true;
+    if((e.key===' '||e.key==='Escape')&&(gState==='playing'||gState==='paused')){ e.preventDefault(); togglePause(); }
+  });
+  document.addEventListener('keyup', e=>{ keys[e.key]=false; });
 }
+
 function onTouch(e) {
   if(e.target.closest('button,#overlay,#pause-btn,#hud'))return;
   e.preventDefault();
   for(const t of e.changedTouches){ if(t.clientY<H/2)touches.top=t.clientX; else touches.bottom=t.clientX; }
 }
 function onTEnd(e) { if(e.target.closest('button,#overlay,#pause-btn,#hud'))return; e.preventDefault(); }
+
+// Gibt neuen X-Wert aus Tastatur-Input fuer ein Paddle zurueck
+function keyboardX(pad){
+  const spd=Math.min(W,H)*0.025;
+  let x=pad.x;
+  if(pad===paddles.p1){
+    if(keys['a']||keys['A']||keys['ArrowLeft'])  x-=spd;
+    if(keys['d']||keys['D']||keys['ArrowRight']) x+=spd;
+  }
+  if(pad===paddles.p2&&mode==='human'){
+    if(keys['q']||keys['Q']||keys['j']||keys['J']) x-=spd;
+    if(keys['e']||keys['E']||keys['l']||keys['L']) x+=spd;
+  }
+  return Math.max(pad.w/2, Math.min(W-pad.w/2, x));
+}
 
 // ─── BOT ──────────────────────────────────────────────────
 function updateBot() {
@@ -863,11 +959,11 @@ function updateBot() {
 
 // ─── ONLINE SYNC ──────────────────────────────────────────
 function sendInput() {
-  if(!conn||!conn.open)return;
+  if(!ws||ws.readyState!==1)return;
   const myX=onlineRole==='p1'?paddles.p1.x:paddles.p2.x;
-  conn.send({type:'input',x:myX});
+  wsSend({t:'input',x:myX});
   if(isHost&&syncTick%3===0){
-    conn.send({type:'state',bx:ball.x,by:ball.y,vx:ball.vx,vy:ball.vy,sp:ball.speed,s1:scores.p1,s2:scores.p2});
+    wsSend({t:'state',bx:ball.x,by:ball.y,vx:ball.vx,vy:ball.vy,sp:ball.speed,s1:scores.p1,s2:scores.p2});
   }
   syncTick++;
 }
@@ -882,18 +978,27 @@ function loop(ts) {
 
 function update(dt) {
   const L=0.22;
-  // P1 (bottom)
-  if(mode==='online'&&onlineRole==='p2'){ if(remoteX!==null)paddles.p1.tx=remoteX; }
-  else if(touches.bottom!==null)paddles.p1.tx=touches.bottom;
+  // P1 (bottom) — Touch ODER Maus ODER Tastatur
+  if(mode==='online'&&onlineRole==='p2'){
+    if(remoteX!==null)paddles.p1.tx=remoteX;
+  } else {
+    if(touches.bottom!==null) paddles.p1.tx=touches.bottom;
+    else if(mouseActive&&mouseX!==null) paddles.p1.tx=mouseX;
+    else paddles.p1.tx=keyboardX(paddles.p1);
+  }
   paddles.p1.x+=(paddles.p1.tx-paddles.p1.x)*L*dt*3;
   paddles.p1.x=Math.max(paddles.p1.w/2,Math.min(W-paddles.p1.w/2,paddles.p1.x));
 
-  // P2 (top)
+  // P2 (top) — Bot, Online, oder 2-Spieler (Touch/Tastatur)
   if(mode==='bot')updateBot();
   else if(mode==='online'){
     if(onlineRole==='p2'){ if(touches.top!==null)paddles.p2.tx=touches.top; }
     else{ if(remoteX!==null)paddles.p2.tx=remoteX; }
-  } else { if(touches.top!==null)paddles.p2.tx=touches.top; }
+  } else {
+    // 2-Spieler lokal: oben mit Touch oder Tastatur (Q/E oder J/L)
+    if(touches.top!==null) paddles.p2.tx=touches.top;
+    else paddles.p2.tx=keyboardX(paddles.p2);
+  }
   paddles.p2.x+=(paddles.p2.tx-paddles.p2.x)*L*dt*3;
   paddles.p2.x=Math.max(paddles.p2.w/2,Math.min(W-paddles.p2.w/2,paddles.p2.x));
 
