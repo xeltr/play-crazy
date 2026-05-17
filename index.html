@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>PNG PONG</title>
+<title>PING PONG</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Orbitron:wght@400;700;900&display=swap');
 
@@ -326,7 +326,7 @@ canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
 <!-- MENU -->
 <div id="menu" class="screen">
   <div class="logo">PONG</div>
-  <div class="tagline">Arcade · Mobile</div>
+  <div class="tagline">Acade · Mobile</div>
   <div class="mode-cards">
     <div class="mode-card vs-bot selected" id="card-bot" onclick="selectMode('bot')">
       <div class="mode-icon">🤖</div><div class="mode-name">VS BOT</div>
@@ -564,8 +564,9 @@ function goLobbyRandom() {
   readProfile(); isHost=false;
   show('lobby'); hide('online-setup');
   document.getElementById('lobby-title').textContent='SUCHE GEGNER';
-  document.getElementById('lobby-sub').textContent='Verbinde mit zufälligem Spieler...';
+  document.getElementById('lobby-sub').textContent='Warte auf einen Mitspieler...';
   document.getElementById('code-box').style.display='none';
+  document.getElementById('lobby-go-btn').classList.remove('show'); // kein manueller Start
   hide('join-row');
   updateMySlot();
   startRandom();
@@ -736,51 +737,52 @@ function autoJoinCode(code){
 }
 
 function startRandom() {
-  // Try 5 fixed pool rooms via WS; if no host after 4s, become host
-  const pool=['RNDM1','RNDM2','RNDM3','RNDM4','RNDM5'];
-  const tryCode=pool[Math.floor(Math.random()*pool.length)];
-  isHost=false; onlineRole='p2';
-  let found=false;
-  wsConnect(tryCode,
+  // ── Matchmaking ohne Code ──────────────────────────────
+  // Alle landen im gleichen Raum "ZUFALLQ" und senden "seek".
+  // Wer als Erster ein fremdes "seek" empfängt wird Host,
+  // antwortet mit "hello" und startet automatisch.
+  // Der andere empfängt "hello" → beide starten sofort.
+  const POOL = 'ZUFALLQ';
+  currentCode = POOL;
+  let matched = false;
+
+  // Zufällige kleine Verzögerung (0–300 ms) damit nicht
+  // zwei Spieler gleichzeitig Host werden
+  const delay = Math.random() * 300;
+
+  wsConnect(POOL,
     () => {
-      wsSend({t:'join', nick:myNick, flag:myFlag});
-      setTimeout(()=>{
-        if(!found){
-          // No host responded — become host
-          wsClose();
-          currentCode=tryCode;
-          isHost=true; onlineRole='p1';
-          document.getElementById('lobby-sub').textContent='Warte auf Zufalls-Gegner...';
-          wsConnect(tryCode,
-            ()=>{},
-            (d)=>{
-              if(d.t==='join'){
-                oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
-                wsSend({t:'hello',nick:myNick,flag:myFlag});
-                showOpponentReady();
-                document.getElementById('lobby-go-btn').classList.add('show');
-                document.getElementById('wait-dots').style.display='none';
-              }
-              if(d.t==='start') beginOnlineGame();
-              if(d.t==='input') remoteX=d.x;
-            },
-            ()=>{}
-          );
-        }
-      }, 4000);
+      setTimeout(() => {
+        if(!matched) wsSend({t:'seek', nick:myNick, flag:myFlag});
+      }, delay);
     },
-    (d)=>{
-      if(d.t==='hello' && !found){
-        found=true;
-        oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️';
+    (d) => {
+      // Fremdes "seek" gesehen → ich werde Host
+      if(d.t === 'seek' && !matched && !isHost) {
+        matched = true;
+        isHost = true; onlineRole = 'p1';
+        oppNick = d.nick||'GEGNER'; oppFlag = d.flag||'🏳️';
+        wsSend({t:'hello', nick:myNick, flag:myFlag});
         showOpponentReady();
+        document.getElementById('lobby-sub').textContent='Gegner gefunden! Starte...';
+        document.getElementById('wait-dots').style.display='none';
+        // Kurze Anzeige dann direkt starten
+        setTimeout(()=>{ wsSend({t:'start'}); beginOnlineGame(); }, 800);
+      }
+      // Ich habe "seek" gesendet und bekomme "hello" → Gast
+      if(d.t === 'hello' && !matched) {
+        matched = true;
+        isHost = false; onlineRole = 'p2';
+        oppNick = d.nick||'HOST'; oppFlag = d.flag||'🏳️';
+        showOpponentReady();
+        document.getElementById('lobby-sub').textContent='Gegner gefunden! Starte...';
         document.getElementById('wait-dots').style.display='none';
       }
-      if(d.t==='start') beginOnlineGame();
-      if(d.t==='input') remoteX=d.x;
-      if(d.t==='state') applyState(d);
+      if(d.t === 'start') beginOnlineGame();
+      if(d.t === 'input') remoteX = d.x;
+      if(d.t === 'state') applyState(d);
     },
-    ()=>{}
+    () => { if(gState==='playing'){ gState='paused'; showOverlay('VERBINDUNG\nVERLOREN','Gegner hat das Spiel verlassen','MENÜ'); } }
   );
 }
 
