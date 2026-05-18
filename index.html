@@ -594,6 +594,7 @@ let rtcCh = null;
 let _onGameData = null;
 let _onGameClose = null;
 let isConnected = false;
+const myClientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
 // Öffentliche STUN/TURN Server für WebRTC
 const ICE = [
@@ -657,7 +658,7 @@ function wsSig(room, onOpen){
   ws.onmessage = e => {
     try {
       const d = JSON.parse(e.data);
-      if(d && d.room === room) handleSig(d);
+      if(d && d.room === room && d.from !== myClientId) handleSig(d);
     } catch(ex){}
   };
   ws.onerror = e => { console.warn('WS error', e); lobbyErr('Verbindungsfehler – Internet prüfen.'); };
@@ -665,7 +666,7 @@ function wsSig(room, onOpen){
 }
 
 function sigSend(obj){
-  if(ws && ws.readyState===1) ws.send(JSON.stringify({...obj, room: wsRoom}));
+  if(ws && ws.readyState===1) ws.send(JSON.stringify({...obj, room: wsRoom, from: myClientId}));
 }
 
 // WebRTC Setup
