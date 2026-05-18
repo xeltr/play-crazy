@@ -312,7 +312,7 @@ canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
   <div class="tagline">Arcade · Mobile</div>
   <div class="mode-cards">
     <div class="mode-card vs-bot selected" id="card-bot" onclick="selectMode('bot')">
-      <div class="mode-icon">😛</div><div class="mode-name">VS BOT</div>
+      <div class="mode-icon">🩼</div><div class="mode-name">VS BOT</div>
       <div class="mode-desc">Spiel gegen<br>KI-Gegner</div>
     </div>
     <div class="mode-card vs-human" id="card-human" onclick="selectMode('human')">
@@ -566,6 +566,7 @@ function updateMySlot() {
 }
 
 function leaveLobby() {
+  stopRandom();
   peerClose();
   currentCode=null;
   const banner=document.getElementById('autojoin-banner');
@@ -626,12 +627,17 @@ function mkCode() {
 
 function mkPeer(id) {
   const cfg = {
+    host: '0.peerjs.com',
+    port: 443,
+    path: '/',
+    secure: true,
+    debug: 0,
     config: {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun2.l.google.com:19302' },
         { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.stunprotocol.org:3478' },
       ]
     }
   };
@@ -738,37 +744,78 @@ function joinByCodeDirect(code){
 // ── ZUFÄLLIG (Matchmaking) ────────────────────────────────
 // Strategie: Jeder versucht zuerst auf einem Slot Host zu werden.
 // Wenn der Slot schon belegt (unavailable-id) → dort wartet jemand → als Gast joinen!
-const RANDOM_SLOTS = ['pool00','pool01','pool02','pool03','pool04'];
+// Slots rotieren durch, nach allen Slots nochmal neu starten.
+const RANDOM_SLOTS = [
+  'ppng5-pool00','ppng5-pool01','ppng5-pool02','ppng5-pool03',
+  'ppng5-pool04','ppng5-pool05','ppng5-pool06','ppng5-pool07'
+];
+let randomSearchActive = false;
+let randomSlotTimer = null;
 
 function startRandom() {
-  document.getElementById('lobby-sub').textContent='Suche Gegner...';
+  randomSearchActive = true;
+  document.getElementById('lobby-sub').textContent='Verbinde mit Server...';
   const slots = [...RANDOM_SLOTS].sort(()=>Math.random()-0.5);
   tryHostSlot(slots, 0);
 }
 
-function tryHostSlot(slots, idx) {
-  if(idx >= slots.length){ lobbyErr('Kein Gegner gefunden – nochmal versuchen!'); return; }
-  const code = slots[idx];
-  isHost=true; onlineRole='p1';
+function stopRandom() {
+  randomSearchActive = false;
+  clearTimeout(randomSlotTimer);
+  if(peer){ try{peer.destroy();}catch(e){} peer=null; }
+}
 
-  peer = mkPeer('ppng5-'+code);
+function tryHostSlot(slots, idx) {
+  if(!randomSearchActive) return;
+  if(idx >= slots.length){
+    document.getElementById('lobby-sub').textContent='Suche nochmal...';
+    randomSlotTimer = setTimeout(()=>{ if(randomSearchActive) startRandom(); }, 2500);
+    return;
+  }
+  const slotId = slots[idx];
+  isHost=true; onlineRole='p1';
+  if(peer){ try{peer.destroy();}catch(e){} peer=null; conn=null; }
+
+  peer = mkPeer(slotId);
+
+  // Timeout: nach 9s nächster Slot
+  randomSlotTimer = setTimeout(()=>{
+    if(!randomSearchActive) return;
+    if(peer){ try{peer.destroy();}catch(e){} peer=null; }
+    tryHostSlot(slots, idx+1);
+  }, 9000);
+
   peer.on('error', e=>{
+    clearTimeout(randomSlotTimer);
+    if(!randomSearchActive) return;
     if(e.type==='unavailable-id'){
-      // Slot belegt → dort wartet jemand → als Gast joinen
-      peer.destroy(); peer=null;
-      joinRandomAsGuest(code);
+      if(peer){ try{peer.destroy();}catch(e2){} peer=null; }
+      joinRandomAsGuest(slotId);
+    } else if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'||e.type==='socket-closed'){
+      lobbyErr('Server nicht erreichbar – Verbindung prüfen');
     } else {
-      lobbyErr('Fehler: '+e.type);
+      if(peer){ try{peer.destroy();}catch(e2){} peer=null; }
+      setTimeout(()=>tryHostSlot(slots, idx+1), 500);
     }
   });
   peer.on('open', ()=>{
+    clearTimeout(randomSlotTimer);
+    if(!randomSearchActive){ peer.destroy(); return; }
     document.getElementById('lobby-sub').textContent='Warte auf Gegner...';
+    // Nach 10s ohne Gegner → weiter
+    randomSlotTimer = setTimeout(()=>{
+      if(!randomSearchActive) return;
+      if(peer){ try{peer.destroy();}catch(e){} peer=null; }
+      tryHostSlot(slots, idx+1);
+    }, 10000);
     peer.on('connection', c=>{
-      if(conn)return;
+      clearTimeout(randomSlotTimer);
+      if(conn||!randomSearchActive){ try{c.close();}catch(e){} return; }
       conn=c;
       setupConnHandlers(c,
         d=>{
           if(d.t==='join'){
+            randomSearchActive=false;
             oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
             gameSend({t:'hello',nick:myNick,flag:myFlag});
             showOpponentReady();
@@ -785,26 +832,35 @@ function tryHostSlot(slots, idx) {
   });
 }
 
-function joinRandomAsGuest(code) {
+function joinRandomAsGuest(slotId) {
+  if(!randomSearchActive) return;
   isHost=false; onlineRole='p2';
+  if(peer){ try{peer.destroy();}catch(e){} peer=null; conn=null; }
   peer = mkPeer();
-  peer.on('error', e=>lobbyErr('Fehler: '+e.type));
+  peer.on('error', e=>{
+    if(!randomSearchActive) return;
+    lobbyErr('Verbindung fehlgeschlagen: '+e.type+' – nochmal versuchen');
+  });
   peer.on('open', ()=>{
-    conn = peer.connect('ppng5-'+code, {reliable:true, serialization:'json'});
+    if(!randomSearchActive){ peer.destroy(); return; }
+    document.getElementById('lobby-sub').textContent='Verbinde mit Gegner...';
+    conn = peer.connect(slotId, {reliable:true, serialization:'json'});
     setupConnHandlers(conn,
       d=>{
         if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('lobby-sub').textContent='Gegner gefunden!'; document.getElementById('wait-dots').style.display='none'; }
-        if(d.t==='start') beginOnlineGame();
+        if(d.t==='start'){ randomSearchActive=false; beginOnlineGame(); }
         if(d.t==='input') remoteX=d.x;
         if(d.t==='state') applyState(d);
       },
       onlineCloseHandler
     );
-    setTimeout(()=>{ if(!isConnected) lobbyErr('Verbindung fehlgeschlagen'); }, 15000);
+    randomSlotTimer = setTimeout(()=>{
+      if(!isConnected && randomSearchActive) lobbyErr('Verbindung zum Gegner fehlgeschlagen – nochmal versuchen');
+    }, 12000);
   });
 }
 
-function becomeRandomHostRTC(code){ tryHostSlot([code],0); }
+function becomeRandomHostRTC(slotId){ tryHostSlot([slotId],0); }
 
 // joinByCode entfernt — nur noch Link-basiert
 
