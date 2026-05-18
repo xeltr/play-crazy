@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>PNG PONG</title>
+<title>PING PONG</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Orbitron:wght@400;700;900&display=swap');
 
@@ -719,67 +719,75 @@ function joinByCodeDirect(code){
 }
 
 // ── ZUFÄLLIG (Matchmaking) ────────────────────────────────
-function startRandom() {
-  const slot = String(Math.floor(Math.random()*30)).padStart(2,'0');
-  const code = 'pool'+slot;
-  isHost=false; onlineRole='p2';
+// Strategie: Jeder versucht zuerst auf einem Slot Host zu werden.
+// Wenn der Slot schon belegt (unavailable-id) → dort wartet jemand → als Gast joinen!
+const RANDOM_SLOTS = ['pool00','pool01','pool02','pool03','pool04'];
 
-  peer = new Peer();
-  peer.on('error', e=>{
-    // peer-unavailable = kein Host in diesem Slot → selbst Host werden
-    if(e.type==='peer-unavailable'){ becomeRandomHostRTC(code); return; }
-    lobbyErr('Fehler: '+e.type);
-  });
-  peer.on('open', ()=>{
-    const tryConn = peer.connect('ppng5-'+code, {reliable:true, serialization:'json'});
-    let hitHost=false;
-    tryConn.on('open', ()=>{
-      hitHost=true; isConnected=true; conn=tryConn;
-      _onGameData = d=>{
-        if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('lobby-sub').textContent='Gegner gefunden!'; document.getElementById('wait-dots').style.display='none'; }
-        if(d.t==='start') beginOnlineGame();
-        if(d.t==='input') remoteX=d.x;
-        if(d.t==='state') applyState(d);
-      };
-      _onGameClose=onlineCloseHandler;
-      tryConn.on('data', d=>{ if(_onGameData) _onGameData(d); });
-      tryConn.on('close', ()=>{ if(_onGameClose) _onGameClose(); });
-      gameSend({t:'join',nick:myNick,flag:myFlag});
-    });
-    // Timeout-Fallback: wenn nach 5s niemand geantwortet hat
-    setTimeout(()=>{ if(!hitHost&&!isHost) becomeRandomHostRTC(code); }, 5000);
-  });
+function startRandom() {
+  document.getElementById('lobby-sub').textContent='Suche Gegner...';
+  const slots = [...RANDOM_SLOTS].sort(()=>Math.random()-0.5);
+  tryHostSlot(slots, 0);
 }
 
-function becomeRandomHostRTC(code){
-  if(isHost)return;
-  peerClose();
+function tryHostSlot(slots, idx) {
+  if(idx >= slots.length){ lobbyErr('Kein Gegner gefunden – nochmal versuchen!'); return; }
+  const code = slots[idx];
   isHost=true; onlineRole='p1';
-  document.getElementById('lobby-sub').textContent='Warte auf Gegner...';
 
   peer = new Peer('ppng5-'+code);
   peer.on('error', e=>{
-    if(e.type==='unavailable-id'){ peer.destroy(); startRandom(); }
-    else lobbyErr('Fehler: '+e.type);
+    if(e.type==='unavailable-id'){
+      // Slot belegt → dort wartet jemand → als Gast joinen
+      peer.destroy(); peer=null;
+      joinRandomAsGuest(code);
+    } else {
+      lobbyErr('Fehler: '+e.type);
+    }
   });
-  peer.on('connection', c=>{
-    conn=c;
-    setupConnHandlers(c,
-      d=>{
-        if(d.t==='join'){
-          oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
-          gameSend({t:'hello',nick:myNick,flag:myFlag});
-          showOpponentReady();
-          document.getElementById('lobby-sub').textContent='Gegner gefunden!';
-          document.getElementById('wait-dots').style.display='none';
-          setTimeout(()=>{ gameSend({t:'start'}); beginOnlineGame(); }, 800);
-        }
-        if(d.t==='input') remoteX=d.x;
-      },
-      onlineCloseHandler
-    );
+  peer.on('open', ()=>{
+    document.getElementById('lobby-sub').textContent='Warte auf Gegner...';
+    peer.on('connection', c=>{
+      if(conn)return;
+      conn=c; isConnected=true;
+      setupConnHandlers(c,
+        d=>{
+          if(d.t==='join'){
+            oppNick=d.nick||'GEGNER'; oppFlag=d.flag||'🏳️';
+            gameSend({t:'hello',nick:myNick,flag:myFlag});
+            showOpponentReady();
+            document.getElementById('lobby-sub').textContent='Gegner gefunden!';
+            document.getElementById('wait-dots').style.display='none';
+            setTimeout(()=>{ gameSend({t:'start'}); beginOnlineGame(); }, 800);
+          }
+          if(d.t==='input') remoteX=d.x;
+        },
+        onlineCloseHandler
+      );
+    });
   });
 }
+
+function joinRandomAsGuest(code) {
+  isHost=false; onlineRole='p2';
+  peer = new Peer();
+  peer.on('error', e=>lobbyErr('Fehler: '+e.type));
+  peer.on('open', ()=>{
+    conn = peer.connect('ppng5-'+code, {reliable:true, serialization:'json'});
+    _onGameData = d=>{
+      if(d.t==='hello'){ oppNick=d.nick||'HOST'; oppFlag=d.flag||'🏳️'; showOpponentReady(); document.getElementById('lobby-sub').textContent='Gegner gefunden!'; document.getElementById('wait-dots').style.display='none'; }
+      if(d.t==='start') beginOnlineGame();
+      if(d.t==='input') remoteX=d.x;
+      if(d.t==='state') applyState(d);
+    };
+    _onGameClose=onlineCloseHandler;
+    conn.on('data', d=>{ if(_onGameData) _onGameData(d); });
+    conn.on('close', ()=>{ if(_onGameClose) _onGameClose(); });
+    conn.on('open', ()=>{ isConnected=true; gameSend({t:'join',nick:myNick,flag:myFlag}); });
+    setTimeout(()=>{ if(!isConnected) lobbyErr('Verbindung fehlgeschlagen'); }, 15000);
+  });
+}
+
+function becomeRandomHostRTC(code){ tryHostSlot([code],0); }
 
 // joinByCode entfernt — nur noch Link-basiert
 
@@ -792,6 +800,7 @@ function showOpponentReady(){
 function hostStartGame() { gameSend({t:'start'}); beginOnlineGame(); }
 
 function beginOnlineGame() {
+  mode = 'online'; // sicherstellen, auch wenn per Link beigetreten
   if(onlineRole==='p1'){ p1Label=myNick+' '+myFlag; p2Label=oppNick+' '+oppFlag; }
   else                  { p1Label=oppNick+' '+oppFlag; p2Label=myNick+' '+myFlag; }
   launchGame();
