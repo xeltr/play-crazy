@@ -327,10 +327,10 @@ canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
 <!-- MENU -->
 <div id="menu" class="screen">
   <div class="logo">PONG</div>
-  <div class="tagline">Arfade · Mobile</div>
+  <div class="tagline">Arcade · Mobile</div>
   <div class="mode-cards">
     <div class="mode-card vs-bot selected" id="card-bot" onclick="selectMode('bot')">
-      <div class="mode-icon">🤖</div><div class="mode-name">VS BOT</div>
+      <div class="mode-icon">😇</div><div class="mode-name">VS BOT</div>
       <div class="mode-desc">Spiel gegen<br>KI-Gegner</div>
     </div>
     <div class="mode-card vs-human" id="card-human" onclick="selectMode('human')">
@@ -347,6 +347,7 @@ canvas { display:block; width:100%; height:100%; position:absolute; inset:0; }
     <button class="diff-btn active" onclick="selectDiff('medium')">Mittel</button>
     <button class="diff-btn" onclick="selectDiff('hard')">Schwer</button>
     <button class="diff-btn" onclick="selectDiff('pro')">PRO</button>
+    <button class="diff-btn" onclick="selectDiff('adaptiv')">Adaptiv</button>
   </div>
   <button class="start-btn" onclick="handleStart()">SPIELEN</button>
   <button id="trophy-btn" onclick="openTrophies()">🏆 TROPHÄEN</button>
@@ -466,12 +467,14 @@ window.addEventListener('unhandledrejection', e => {
 const WIN = 7;
 const PAD_W = 0.14, PAD_H = 0.018;
 
-// Hard & Pro made noticeably easier
 const BOT_CFG = {
-  easy:   { speed:3.5, error:90, delay:18, predict:false },
-  medium: { speed:5.5, error:45, delay:8,  predict:false },
-  hard:   { speed:6.0, error:55, delay:9,  predict:true  }, // was 7/30/5
-  pro:    { speed:7.5, error:35, delay:5,  predict:true  }, // was 9.5/14/2
+  easy:       { speed:3.5, error:90, delay:18, predict:false },
+  medium:     { speed:5.5, error:45, delay:8,  predict:false },
+  hard:       { speed:6.0, error:55, delay:9,  predict:true  },
+  pro:        { speed:7.5, error:35, delay:5,  predict:true  },
+  // adaptiv: startet wie medium, steigt nach 5 Gegentoren auf hard
+  adaptiv:    { speed:5.5, error:45, delay:8,  predict:false },
+  adaptiv_2:  { speed:7.0, error:30, delay:4,  predict:true  }, // nach 5 Gegentoren
 };
 
 // ─── STATE ────────────────────────────────────────────────
@@ -482,6 +485,7 @@ let canvas, ctx, W, H;
 let paddles, ball, trail;
 let animId, lastTime = 0;
 let botDelayBuf = [], botErrorOffset = 0;
+let botAdaptPhase = 0; // 0=normal, 1=hard (nach 5 Gegentoren beim adaptiven Modus)
 const touches = { top:null, bottom:null };
 
 // Online
@@ -533,7 +537,7 @@ function selectMode(m) {
 function selectDiff(d) {
   diff = d;
   document.querySelectorAll('.diff-btn').forEach((b,i) =>
-    b.classList.toggle('active', ['easy','medium','hard','pro'][i]===d));
+    b.classList.toggle('active', ['easy','medium','hard','pro','adaptiv'][i]===d));
 }
 
 function handleStart() {
@@ -909,13 +913,15 @@ function launchGame() {
   }
 
   canvas=document.getElementById('c'); ctx=canvas.getContext('2d'); resize();
-  scores={p1:0,p2:0}; updateHUD(); sessionComebackEligible=false;
+  scores={p1:0,p2:0}; updateHUD(); sessionComebackEligible=false; botAdaptPhase=0;
   initRound(1); setupTouch();
   gState='playing'; cancelAnimationFrame(animId); animId=requestAnimationFrame(loop);
 
-  if(mode==='bot'&&(diff==='hard'||diff==='pro')){
+  if(mode==='bot'&&(diff==='hard'||diff==='pro'||diff==='adaptiv')){
     gState='paused';
-    showOverlay(diff==='pro'?'PRO MODE':'SCHWER','💡 Paddle-Rand = Kurve\nBall an die Ecken!','LOS GEHT\'S');
+    const titles={hard:'SCHWER',pro:'PRO MODE',adaptiv:'ADAPTIV'};
+    const hints={hard:'💡 Paddle-Rand = Kurve\nBall an die Ecken!',pro:'💡 Paddle-Rand = Kurve\nBall an die Ecken!',adaptiv:'🧠 Bot lernt mit!\nNach 5 Gegentoren wird er stärker.'};
+    showOverlay(titles[diff],hints[diff],'LOS GEHT\'S');
   }
 
   // PC-Steuerung Hinweis (kein Touch-Gerät)
@@ -934,10 +940,14 @@ function launchGame() {
 
 function goMenu() {
   gState='idle'; cancelAnimationFrame(animId);
+  if(mode==='online') peerClose();
   document.getElementById('game').style.display='none';
   document.getElementById('overlay').classList.add('hidden');
+  document.getElementById('lobby').classList.add('hidden');
+  document.getElementById('online-setup').classList.add('hidden');
   document.getElementById('menu').classList.remove('hidden');
-  selectMode(mode); // fix: re-apply so cards are interactive
+  selectMode(mode);
+  selectDiff(diff);
 }
 
 function show(id){ document.getElementById(id).classList.remove('hidden'); }
@@ -958,6 +968,7 @@ function initRound(dir) {
   const ang=(Math.random()*0.6-0.3);
   ball={x:W/2,y:H/2,vx:Math.sin(ang)*sp*(Math.random()<0.5?1:-1),vy:dir*sp*Math.cos(ang)*0.95,r:Math.min(W,H)*0.018,speed:sp};
   trail=[]; botDelayBuf=[]; botErrorOffset=0; remoteX=null; syncTick=0;
+  if(diff!=='adaptiv') botAdaptPhase=0;
 }
 
 // ─── TOUCH + MAUS + TASTATUR ──────────────────────────────
@@ -990,11 +1001,16 @@ function setupTouch() {
 }
 
 function onTouch(e) {
+  if(gState==='idle'||gState==='over')return; // Menü-Touches nicht abfangen
   if(e.target.closest('button,#overlay,#pause-btn,#hud'))return;
   e.preventDefault();
   for(const t of e.changedTouches){ if(t.clientY<H/2)touches.top=t.clientX; else touches.bottom=t.clientX; }
 }
-function onTEnd(e) { if(e.target.closest('button,#overlay,#pause-btn,#hud'))return; e.preventDefault(); }
+function onTEnd(e) {
+  if(gState==='idle'||gState==='over')return;
+  if(e.target.closest('button,#overlay,#pause-btn,#hud'))return;
+  e.preventDefault();
+}
 
 // Gibt neuen X-Wert aus Tastatur-Input fuer ein Paddle zurueck
 function keyboardX(pad){
@@ -1013,7 +1029,9 @@ function keyboardX(pad){
 
 // ─── BOT ──────────────────────────────────────────────────
 function updateBot() {
-  const cfg=BOT_CFG[diff];
+  let cfgKey = diff;
+  if(diff==='adaptiv') cfgKey = botAdaptPhase===1 ? 'adaptiv_2' : 'adaptiv';
+  const cfg=BOT_CFG[cfgKey];
   botDelayBuf.push(ball.x);
   if(botDelayBuf.length>cfg.delay+1)botDelayBuf.shift();
   const sx=botDelayBuf[0];
@@ -1112,6 +1130,11 @@ function goal(scorer){
   updateHUD(scorer);
   doFlash(scorer==='p1'?'#00e5ff44':'#ff2d7844');
   trackComeback();
+  // Adaptiver Bot: nach 5 Gegentoren (p1 gewinnt 5) wird er schwerer
+  if(diff==='adaptiv' && scorer==='p1' && scores.p1===5 && botAdaptPhase===0){
+    botAdaptPhase=1;
+    showToast('🔥','BOT WIRD STÄRKER!');
+  }
   if(scores[scorer]>=WIN){gameOver(scorer);return;}
   gState='goal';
   const dir=scorer==='p1'?-1:1;
@@ -1214,9 +1237,14 @@ function togglePause(){
 
 function overlayAction(){
   if(gState==='over'){
-    scores={p1:0,p2:0}; updateHUD(); sessionComebackEligible=false; initRound(1); gState='playing';
-  } else gState='playing';
-  document.getElementById('overlay').classList.add('hidden');
+    // NEU SPIELEN: direkt nochmal spielen
+    document.getElementById('overlay').classList.add('hidden');
+    scores={p1:0,p2:0}; updateHUD(); sessionComebackEligible=false; botAdaptPhase=0;
+    initRound(1); gState='playing';
+  } else {
+    gState='playing';
+    document.getElementById('overlay').classList.add('hidden');
+  }
 }
 
 function lobbyErr(msg){
@@ -1231,6 +1259,7 @@ const TDEFS=[
   {id:'bot_easy',  icon:'🤖',name:'BOT BESIEGT',   desc:'KI auf Leicht\nbesiegt',        color:'cyan'},
   {id:'bot_medium',icon:'⚡',name:'AUFSTEIGER',    desc:'KI auf Mittel\nbesiegt',        color:'cyan'},
   {id:'bot_hard',  icon:'🔥',name:'PROFI',         desc:'KI auf Schwer\nbesiegt',        color:'pink'},
+  {id:'bot_adaptiv',icon:'🧠',name:'ANPASSER',      desc:'Adaptiven Bot\nbesiegt',          color:'pink'},
   {id:'bot_pro',   icon:'💀',name:'LEGENDE',       desc:'KI auf PRO\nbesiegt',           color:'gold'},
   {id:'shutout',   icon:'😤',name:'SHUTOUT',       desc:'Gegner auf 0\ngehalten (7:0)', color:'gold'},
   {id:'comeback',  icon:'🔄',name:'COMEBACK',      desc:'Von 0:3 auf\nSieg gedreht',    color:'pink'},
@@ -1287,7 +1316,7 @@ function checkTrophies(winner){
     if(st.w>=10)unlockT('win10');
     if(winner==='p1'&&scores.p2===0)unlockT('shutout');
     if(mode==='bot'){
-      unlockT('bot_'+diff);
+      unlockT('bot_'+diff); // covers easy,medium,hard,pro,adaptiv
     }
     if(mode==='human')unlockT('pvp_win');
     if(mode==='online')unlockT('online_win');
